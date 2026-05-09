@@ -531,5 +531,5 @@ if run_analysis:
 # 11. Footer
 # ─────────────────────────────────────────────────────────────
 st.divider()
-st.caption("❤️ Heart Attack Expert System · Developed by Mohamed Mustafa AbdelAziz · O6U · 2025")
+# st.caption("❤️ Heart Attack Expert System · Developed by Mohamed Mustafa AbdelAziz · O6U · 2025")
 st.caption("⚕️ *For educational purposes only. Not a substitute for professional medical advice.*")
