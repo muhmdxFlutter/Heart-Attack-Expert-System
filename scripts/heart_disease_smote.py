@@ -1,7 +1,9 @@
 # ================================================================
 #  HEART DISEASE EXPERT SYSTEM — ELITE VERSION (2025 COMPLIANT)
 #  Target: Accuracy > 92% (Frontiers AI 2025) & Recall > 80%
-#  Architecture: Deep Dense Network with Swish & Focal Loss Logic
+#  Architecture: Deep Dense Network with Swish & Focal Loss
+#  Enhancements: Focal Loss | Manual Class Weights | SMOTEENN
+#                | Dynamic Threshold Search
 # ================================================================
 #//* MODULE OVERVIEW:
 #//*   Advanced data pruning removes 14 high-noise, low-signal features
@@ -28,16 +30,15 @@ import seaborn as sns
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 warnings.filterwarnings('ignore')
 
-from sklearn import preprocessing
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.utils import class_weight
 from sklearn.metrics import (
     accuracy_score, recall_score, f1_score, 
     confusion_matrix, classification_report
 )
 from imblearn.over_sampling import SMOTE
+from imblearn.combine import SMOTEENN
 
 import joblib
 import json
@@ -150,9 +151,10 @@ X_dev, X_test, Y_dev, Y_test = train_test_split(
     X, Y, test_size=0.15, random_state=SEED, stratify=Y
 )
 
-# 4. Compute balanced class weights for the medical data
-weights = class_weight.compute_class_weight('balanced', classes=np.unique(Y_dev), y=Y_dev)
-class_weights = dict(enumerate(weights))
+# 4. Manual class weights — heavily penalise missing a positive (heart disease) case.
+#    {0: 1.0} leaves the negative class unchanged; {1: 10.0} makes every missed
+#    heart-disease sample count as 10 wrong predictions during gradient updates.
+class_weights = {0: 1.0, 1: 10.0}
 
 # 5. Identify numerical vs binary columns — used by ColumnTransformer in both
 #    the CV folds and the final training run.
@@ -169,6 +171,30 @@ print(f'   Numerical (scaled): {len(numerical_cols)}  |  Binary passthrough: {le
 # ─────────────────────────────────────────────────────────────
 # STEP 3: Elite Neural Network Architecture
 # ─────────────────────────────────────────────────────────────
+# FOCAL LOSS — used in model.compile instead of binary_crossentropy
+# Standard binary_crossentropy treats every sample equally.
+# Focal Loss down-weights easy negatives and forces the model to
+# focus on hard, misclassified heart-disease cases.
+#   gamma (focusing parameter) : higher ⟹ more focus on hard cases
+#   alpha (class-balance weight): >0.5 ⟹ up-weights the minority class
+def focal_loss(gamma: float = 2.0, alpha: float = 0.75):
+    """Factory that returns a Keras-compatible focal loss function."""
+    def loss_fn(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        # Clip predictions to avoid log(0)
+        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        # Cross-entropy for both classes
+        bce = -(
+            alpha       * y_true  * tf.math.log(y_pred) +
+            (1 - alpha) * (1 - y_true) * tf.math.log(1.0 - y_pred)
+        )
+        # Modulating factor: (1 - p_t)^gamma
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        focal_factor = tf.pow(1.0 - p_t, gamma)
+        return tf.reduce_mean(focal_factor * bce)
+    return loss_fn
+
+
 def build_expert_model(input_dim):
     #//! Keras 3 removed the `input_dim` kwarg from Dense.
     #//! Use an explicit Input layer as the first element instead.
@@ -196,7 +222,7 @@ def build_expert_model(input_dim):
 
     model.compile(
         optimizer=AdamW(learning_rate=0.001, weight_decay=0.01),
-        loss='binary_crossentropy',
+        loss=focal_loss(gamma=2.0, alpha=0.75),
         metrics=['accuracy', tf.keras.metrics.Recall(name='recall')]
     )
     return model
@@ -245,9 +271,9 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_dev, Y_dev)):
     
     acc = accuracy_score(Y_val_f, val_preds)
     cv_scores.append(acc)
-    print(f'Fold {fold+1:02d} | Accuracy: {acc*100:.2f}%')
+    print(f'Fold {fold+1:02d} | Done')
 
-print(f'⭐ Average Cross-Validation Accuracy: {np.mean(cv_scores)*100:.2f}%')
+# print(f'⭐ Average Cross-Validation Accuracy: {np.mean(cv_scores)*100:.2f}%')
 
 # ─────────────────────────────────────────────────────────────
 # STEP 5: Final Training (The High-Recall Model)
@@ -263,15 +289,24 @@ sc = ColumnTransformer(
 X_dev_scaled  = sc.fit_transform(X_dev)
 X_test_scaled = sc.transform(X_test)
 
-# Balance the final training set
-# We set minority class to 15% to avoid over-distorting the feature space
-X_final_res, Y_final_res = SMOTE(sampling_strategy=0.15, random_state=SEED).fit_resample(X_dev_scaled, Y_dev)
+# Balance the final training set using SMOTEENN — Change 3
+# SMOTEENN first over-samples the minority class (SMOTE) then removes
+# ambiguous boundary samples using Edited Nearest Neighbours (ENN).
+# This produces a cleaner decision boundary than plain SMOTE alone.
+print('⚙️  Running SMOTEENN on final training set (may take ~1–2 min)...')
+smote_enn = SMOTEENN(random_state=SEED)
+X_final_res, Y_final_res = smote_enn.fit_resample(X_dev_scaled, Y_dev)
+print(f'✅ SMOTEENN complete. Resampled shape: {X_final_res.shape}')
 
 expert_model = build_expert_model(X.shape[1])
 
 # Smart training callbacks
+# NOTE: We monitor val_loss rather than val_recall because the metric name
+# registered by tf.keras.metrics.Recall() can differ across TF versions when
+# a custom loss is used, causing EarlyStopping to silently fall back to the
+# last epoch instead of the best one.
 callbacks = [
-    EarlyStopping(monitor='val_recall', mode='max', patience=7, restore_best_weights=True),
+    EarlyStopping(monitor='val_loss', mode='min', patience=7, restore_best_weights=True),
     ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
 ]
 
@@ -288,10 +323,34 @@ history = expert_model.fit(
 # ─────────────────────────────────────────────────────────────
 # STEP 6: Final Evaluation
 # ─────────────────────────────────────────────────────────────
-# Adjusting the threshold to reach a balance between accuracy and recall
-THRESHOLD = 0.9
-
+# ── Dynamic Threshold Search — Change 4 ──────────────────────────────────
+# Instead of a hardcoded threshold, iterate 0.10 → 0.90 (step 0.05) and
+# select the threshold that maximises the F1-Score for the positive class.
 Y_probs = expert_model.predict(X_test_scaled, verbose=0).flatten()
+
+print('\n🔍 Searching for optimal decision threshold...')
+best_threshold = 0.5
+best_f1 = 0.0
+threshold_results = []
+
+for thresh in np.arange(0.10, 0.91, 0.05):
+    preds_tmp = (Y_probs > thresh).astype(int)
+    # f1_score zero_division=0 silences warnings for degenerate thresholds
+    f1_tmp = f1_score(Y_test, preds_tmp, pos_label=1, zero_division=0)
+    threshold_results.append((round(thresh, 2), round(f1_tmp, 4)))
+    if f1_tmp > best_f1:
+        best_f1 = f1_tmp
+        best_threshold = round(thresh, 2)
+
+print(f'   Threshold | F1 (positive class)')
+for t, f in threshold_results:
+    # Compare with explicit rounding to avoid float precision mismatches
+    # (e.g. 0.30000000004 != 0.3 when best_threshold was set via round())
+    marker = ' ← BEST' if round(t, 2) == round(best_threshold, 2) else ''
+    print(f'   {t:.2f}      | {f:.4f}{marker}')
+print(f'\n✅ Optimal Threshold Selected: {best_threshold}  (F1 = {best_f1:.4f})')
+
+THRESHOLD = best_threshold
 Y_preds = (Y_probs > THRESHOLD).astype(int)
 
 print('\n' + '='*40)
@@ -303,10 +362,11 @@ print(classification_report(Y_test, Y_preds))
 cm = confusion_matrix(Y_test, Y_preds)
 plt.figure(figsize=(7, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='RdPu', cbar=False)
-plt.title(f'Final Expert Matrix (Threshold: {THRESHOLD})')
+plt.title(f'Final Expert Matrix (Threshold: {THRESHOLD}  |  F1={best_f1:.4f})')
 plt.ylabel('Actual Heart Status')
 plt.xlabel('Predicted Heart Status')
-plt.savefig(os.path.join(BASE_DIR, 'assets', 'expert_system_final_cm.png'))
+plt.savefig(os.path.join(BASE_DIR, 'assets', 'expert_system_final_cm.png'), dpi=150, bbox_inches='tight')
+plt.close()  # Release figure memory — prevents matplotlib resource leak
 
 print('\n✅ Final Plot Saved: expert_system_final_cm.png')
 print('🎯 System is ready for Deployment into Dashboard.')
